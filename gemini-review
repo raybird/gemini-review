@@ -60,28 +60,217 @@ if ! command -v gemini &> /dev/null; then
     exit 1
 fi
 
+# 檢查是否有任何 commit
+HAS_COMMITS=false
+if git rev-parse --verify HEAD > /dev/null 2>&1; then
+    HAS_COMMITS=true
+fi
+
 # 生成審查命令
 if [ "$STAGED" = true ]; then
     echo "正在審查已暫存的變更..."
     DIFF_CMD="git diff --cached"
+    DIFF_CONTEXT="已暫存的變更"
+elif [ "$HAS_COMMITS" = false ]; then
+    # 如果還沒有任何 commit，審查所有已暫存的變更，如果沒有則審查工作目錄變更
+    if git diff --cached --quiet 2>/dev/null; then
+        if git diff --quiet 2>/dev/null; then
+            echo "錯誤: 沒有任何變更可審查" >&2
+            echo "提示: 請先暫存一些變更 (git add) 或建立第一個 commit" >&2
+            exit 1
+        else
+            echo "正在審查工作目錄的變更（尚未有任何 commit）..."
+            DIFF_CMD="git diff"
+            DIFF_CONTEXT="工作目錄的變更"
+        fi
+    else
+        echo "正在審查已暫存的變更（尚未有任何 commit）..."
+        DIFF_CMD="git diff --cached"
+        DIFF_CONTEXT="已暫存的變更"
+    fi
 else
     # 檢查分支是否存在
-    if ! git rev-parse --verify "$BASE_BRANCH" &>/dev/null; then
+    if ! git rev-parse --verify "$BASE_BRANCH" >/dev/null 2>&1; then
         echo "錯誤: 分支 '$BASE_BRANCH' 不存在" >&2
+        echo "提示: 如果這是第一次提交，請使用 '-s' 選項審查已暫存的變更" >&2
         exit 1
     fi
     echo "正在審查與 $BASE_BRANCH 的差異..."
     DIFF_CMD="git diff $BASE_BRANCH...HEAD"
+    DIFF_CONTEXT="與 $BASE_BRANCH 分支的差異"
 fi
 
-# 執行審查
-REVIEW_CMD="$DIFF_CMD | gemini -p '審查這些變更是否存在錯誤、安全性問題和程式碼品質問題。請提供具體建議。'"
+# 先取得 diff 內容到臨時檔案
+TEMP_DIFF=$(mktemp)
+trap "rm -f $TEMP_DIFF" EXIT
+
+eval "$DIFF_CMD" > "$TEMP_DIFF"
+
+# 檢查是否有差異內容
+if [ ! -s "$TEMP_DIFF" ]; then
+    echo "沒有發現任何變更" >&2
+    exit 1
+fi
+
+# 構建明確的提示詞，強調這是程式碼審查任務，不要執行命令
+# 使用單引號避免變數展開問題，並明確指示這是要審查的程式碼差異
+PROMPT='請審查以下 Git Repo 的差異。這是一個審查任務，請分析變更並提供建議：
+
+1. 程式碼錯誤和邏輯問題
+2. 安全性問題
+3. 程式碼品質（風格、最佳實踐、效能等）
+
+請只提供審查結果和建議的文字回應，不要執行任何命令或工具。'
+
+# 執行審查：將 diff 內容通過標準輸入傳給 Gemini
+# 使用 stream-json 格式以獲得即時輸出（根據 Gemini CLI 文檔）
+# 暫時關閉 set -e 以正確處理管道命令的錯誤
+set +e
+
+# 檢查是否可以使用 jq 來解析 JSON（用於 stream-json 格式）
+HAS_JQ=false
+if command -v jq > /dev/null 2>&1; then
+    HAS_JQ=true
+fi
+
+# 處理 stream-json 輸出的函數
+# 從 stream-json 事件中提取並顯示文字內容
+# 根據 Gemini CLI 文檔：https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/headless.md
+process_stream_json() {
+    local line
+    local event_type
+    local content
+    local first_content=true
+    local final_status=""
+    local has_error=false
+    
+    while IFS= read -r line || [ -n "$line" ]; do
+        # 處理 stderr 輸出（非 JSON 行，可能是載入訊息等）
+        if ! echo "$line" | jq -e . > /dev/null 2>&1; then
+            # 過濾掉常見的非錯誤訊息（如 "Loaded cached credentials"）
+            if echo "$line" | grep -qE "^(Loaded|Okay)" 2>/dev/null; then
+                continue
+            fi
+            # 其他非 JSON 行可能是錯誤，輸出到 stderr
+            echo "$line" >&2
+            continue
+        fi
+        
+        # 取得事件類型
+        event_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
+        
+        case "$event_type" in
+            "init")
+                # 初始化事件，靜默處理（已顯示「正在審查中」）
+                ;;
+            "message")
+                # 訊息事件，提取 assistant 的內容
+                local role=$(echo "$line" | jq -r '.role // empty' 2>/dev/null)
+                if [ "$role" = "assistant" ]; then
+                    content=$(echo "$line" | jq -r '.content // empty' 2>/dev/null)
+                    if [ -n "$content" ] && [ "$content" != "null" ] && [ "$content" != "" ]; then
+                        # 輸出內容（stream-json 會即時輸出，不需要特殊處理 delta）
+                        echo -n "$content"
+                        first_content=false
+                    fi
+                fi
+                ;;
+            "tool_use")
+                # 工具使用事件（在程式碼審查中不應該發生，但記錄以供調試）
+                # 不輸出，避免干擾審查結果
+                ;;
+            "tool_result")
+                # 工具結果事件（不應該發生）
+                ;;
+            "error")
+                # 錯誤事件
+                local error_msg=$(echo "$line" | jq -r '.message // .error // empty' 2>/dev/null)
+                if [ -n "$error_msg" ] && [ "$error_msg" != "null" ]; then
+                    echo "" >&2
+                    echo "錯誤: $error_msg" >&2
+                    has_error=true
+                fi
+                ;;
+            "result")
+                # 最終結果事件
+                final_status=$(echo "$line" | jq -r '.status // empty' 2>/dev/null)
+                if [ "$final_status" = "error" ]; then
+                    local error_obj=$(echo "$line" | jq -r '.error // empty' 2>/dev/null)
+                    if [ -n "$error_obj" ] && [ "$error_obj" != "null" ]; then
+                        local error_msg=$(echo "$error_obj" | jq -r '.message // . // empty' 2>/dev/null)
+                        echo "" >&2
+                        echo "審查失敗: $error_msg" >&2
+                        has_error=true
+                    fi
+                fi
+                # 確保最後有一個換行
+                if [ "$first_content" = false ]; then
+                    echo ""
+                fi
+                ;;
+            *)
+                # 未知事件類型，忽略
+                ;;
+        esac
+    done
+    
+    # 如果有錯誤，返回非零退出碼
+    if [ "$has_error" = true ] || [ "$final_status" = "error" ]; then
+        return 1
+    fi
+    
+    return 0
+}
 
 if [ -n "$OUTPUT_FILE" ]; then
+    # 輸出到檔案
     echo "審查結果將儲存到: $OUTPUT_FILE"
-    eval "$REVIEW_CMD" > "$OUTPUT_FILE"
+    echo "正在審查中，請稍候..."
+    
+    # 對於檔案輸出，使用 text 格式更合適
+    cat "$TEMP_DIFF" | gemini -p "$PROMPT" -o text > "$OUTPUT_FILE" 2>&1
+    GEMINI_EXIT_CODE=$?
+    set -e
+    if [ $GEMINI_EXIT_CODE -ne 0 ]; then
+        echo "錯誤: 審查過程發生問題，請檢查輸出檔案" >&2
+        exit 1
+    fi
     echo "✓ 完成！"
 else
-    eval "$REVIEW_CMD"
+    # 直接輸出到終端
+    # 使用 stream-json 格式以獲得即時輸出
+    echo "正在審查中，請稍候..."
+    echo ""
+    
+    if [ "$HAS_JQ" = true ]; then
+        # 如果有 jq，使用 stream-json 格式並處理事件流
+        # 注意：將 stderr 重定向到 stdout，process_stream_json 會過濾非 JSON 行
+        cat "$TEMP_DIFF" | gemini -p "$PROMPT" -o stream-json 2>&1 | process_stream_json
+        # 檢查管道中所有命令的退出碼
+        GEMINI_EXIT_CODE=${PIPESTATUS[1]}  # gemini 的退出碼
+        PROCESS_EXIT_CODE=$?  # process_stream_json 的退出碼
+        # 如果任何一個失敗，則視為失敗
+        if [ $GEMINI_EXIT_CODE -ne 0 ] || [ $PROCESS_EXIT_CODE -ne 0 ]; then
+            GEMINI_EXIT_CODE=1
+        fi
+    else
+        # 如果沒有 jq，使用 text 格式並嘗試使用 stdbuf 來禁用緩衝
+        if command -v stdbuf > /dev/null 2>&1; then
+            # 使用 stdbuf 禁用緩衝，確保即時輸出
+            cat "$TEMP_DIFF" | stdbuf -o 0 -e 0 gemini -p "$PROMPT" -o text 2>&1
+            GEMINI_EXIT_CODE=${PIPESTATUS[1]}
+        else
+            # 最後的備選方案：直接執行
+            cat "$TEMP_DIFF" | gemini -p "$PROMPT" -o text 2>&1
+            GEMINI_EXIT_CODE=${PIPESTATUS[1]}
+        fi
+    fi
+    
+    set -e
+    if [ $GEMINI_EXIT_CODE -ne 0 ]; then
+        echo "" >&2
+        echo "錯誤: 審查過程發生問題" >&2
+        exit 1
+    fi
 fi
 
