@@ -1,0 +1,87 @@
+#!/bin/bash
+# Code Review Script using Gemini AI
+
+set -e
+
+# 顯示使用說明
+show_help() {
+    cat << EOF
+使用方式: gemini-review [選項] [基礎分支]
+
+選項:
+  -h, --help     顯示此說明
+  -o, --output   輸出到檔案 (預設: 顯示在終端)
+  -s, --staged   只審查已暫存的變更
+  
+範例:
+  gemini-review              # 與 dev 分支比較
+  gemini-review main         # 與 main 分支比較
+  gemini-review -s           # 審查已暫存的變更
+  gemini-review -o review.txt main  # 輸出到檔案
+EOF
+}
+
+# 預設值
+BASE_BRANCH="dev"
+OUTPUT_FILE=""
+STAGED=false
+
+# 解析參數
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -o|--output)
+            OUTPUT_FILE="$2"
+            shift 2
+            ;;
+        -s|--staged)
+            STAGED=true
+            shift
+            ;;
+        *)
+            BASE_BRANCH="$1"
+            shift
+            ;;
+    esac
+done
+
+# 檢查是否在 git 倉庫中
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    echo "錯誤: 不在 git 倉庫中" >&2
+    exit 1
+fi
+
+# 檢查 gemini 是否安裝
+if ! command -v gemini &> /dev/null; then
+    echo "錯誤: 找不到 gemini 指令，請先安裝 gemini CLI" >&2
+    exit 1
+fi
+
+# 生成審查命令
+if [ "$STAGED" = true ]; then
+    echo "正在審查已暫存的變更..."
+    DIFF_CMD="git diff --cached"
+else
+    # 檢查分支是否存在
+    if ! git rev-parse --verify "$BASE_BRANCH" &>/dev/null; then
+        echo "錯誤: 分支 '$BASE_BRANCH' 不存在" >&2
+        exit 1
+    fi
+    echo "正在審查與 $BASE_BRANCH 的差異..."
+    DIFF_CMD="git diff $BASE_BRANCH...HEAD"
+fi
+
+# 執行審查
+REVIEW_CMD="$DIFF_CMD | gemini -p '審查這些變更是否存在錯誤、安全性問題和程式碼品質問題。請提供具體建議。'"
+
+if [ -n "$OUTPUT_FILE" ]; then
+    echo "審查結果將儲存到: $OUTPUT_FILE"
+    eval "$REVIEW_CMD" > "$OUTPUT_FILE"
+    echo "✓ 完成！"
+else
+    eval "$REVIEW_CMD"
+fi
+
