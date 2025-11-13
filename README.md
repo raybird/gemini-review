@@ -31,10 +31,10 @@
 如果專案已上傳到 GitHub，可以使用以下命令一鍵安裝：
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/gemini-review/main/install.sh)" -- YOUR_USERNAME/gemini-review
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/raybird/gemini-review/main/install.sh)" -- raybird/gemini-review
 ```
 
-> **注意**：請將 `YOUR_USERNAME` 替換為您的 GitHub 使用者名稱，或根據實際的倉庫路徑調整 URL。
+> **注意**：請將 `raybird` 替換為您的 GitHub 使用者名稱，或根據實際的倉庫路徑調整 URL。
 
 **或者**，如果已經下載了專案到本地，可以直接執行：
 
@@ -46,7 +46,7 @@ bash install.sh
 **或者**，從 GitHub 下載安裝腳本後，指定倉庫位置：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/gemini-review/main/install.sh | bash -s -- YOUR_USERNAME/gemini-review
+curl -fsSL https://raw.githubusercontent.com/raybird/gemini-review/main/install.sh | bash -s -- raybird/gemini-review
 ```
 
 安裝腳本會自動：
