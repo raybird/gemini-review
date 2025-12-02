@@ -1,0 +1,234 @@
+#!/bin/bash
+# Generate commit message using Gemini AI
+
+set -e
+
+# 顯示使用說明
+show_help() {
+    cat << EOF
+使用方式: gemini-commit [選項]
+
+選項:
+  -h, --help     顯示此說明
+  
+功能:
+  1. 查看已暫存（staged）的檔案列表
+  2. 分析所有已暫存檔案的變更內容
+  3. 生成符合 Conventional Commits 1.0.0 規範的 commit 訊息
+  4. 以中文輸出到 code block 中，方便複製（不會自動提交）
+
+範例:
+  gemini-commit              # 生成 commit 訊息
+EOF
+}
+
+# 解析參數
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "未知選項: $1" >&2
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# 檢查是否在 git 倉庫中
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    echo "錯誤: 不在 git 倉庫中" >&2
+    exit 1
+fi
+
+# 檢查 gemini 是否安裝
+if ! command -v gemini &> /dev/null; then
+    echo "錯誤: 找不到 gemini 指令，請先安裝 gemini CLI" >&2
+    exit 1
+fi
+
+# 步驟 1: 查看已暫存的檔案列表
+echo "正在檢查已暫存的檔案..."
+STAGED_FILES=$(git diff --cached --name-only)
+
+if [ -z "$STAGED_FILES" ]; then
+    echo "錯誤: 沒有已暫存的檔案" >&2
+    echo "提示: 請先使用 'git add' 暫存一些變更" >&2
+    exit 1
+fi
+
+echo "找到以下已暫存的檔案："
+echo "$STAGED_FILES" | sed 's/^/  - /'
+echo ""
+
+# 步驟 2: 取得所有已暫存檔案的變更內容
+echo "正在取得變更內容..."
+TEMP_DIFF=$(mktemp)
+TEMP_COMMIT_MSG=$(mktemp)
+trap "rm -f $TEMP_DIFF $TEMP_COMMIT_MSG" EXIT
+
+git diff --cached > "$TEMP_DIFF"
+
+# 檢查是否有變更內容
+if [ ! -s "$TEMP_DIFF" ]; then
+    echo "錯誤: 沒有發現任何變更內容" >&2
+    exit 1
+fi
+
+# 步驟 3: 構建提示詞，要求生成符合 Conventional Commits 1.0.0 規範的訊息
+PROMPT='請根據以下 Git 變更內容，生成符合 Conventional Commits 1.0.0 規範的精簡版 commit 訊息。
+
+要求：
+1. 使用 Conventional Commits 1.0.0 規範格式：<type>(<scope>): <subject>
+2. 類型（type）必須是以下之一：feat, fix, docs, style, refactor, perf, test, chore, build, ci
+3. 標題（subject）必須簡潔明瞭，使用繁體中文，不超過 72 個字元
+4. scope（可選）：可以指定影響範圍，例如檔案、模組等
+5. 如果需要，可以在 body 中補充說明（可選），但主要內容應在標題中
+6. 只輸出 commit 訊息本身，不要包含其他說明、註解或 code block 標記
+
+請使用繁體中文生成 commit 訊息。
+
+以下是程式碼變更：
+
+'
+
+# 執行並生成 commit 訊息
+echo "正在使用 Gemini AI 生成 commit 訊息..."
+echo ""
+
+# 暫時關閉 set -e 以正確處理管道命令的錯誤
+set +e
+
+# 檢查是否可以使用 jq 來解析 JSON（用於 stream-json 格式）
+HAS_JQ=false
+if command -v jq > /dev/null 2>&1; then
+    HAS_JQ=true
+fi
+
+# 處理 stream-json 輸出的函數（簡化版，只提取訊息內容）
+process_stream_json() {
+    local line
+    local event_type
+    local content
+    local first_content=true
+    local final_status=""
+    local has_error=false
+    
+    while IFS= read -r line || [ -n "$line" ]; do
+        # 處理 stderr 輸出（非 JSON 行）
+        if ! echo "$line" | jq -e . > /dev/null 2>&1; then
+            # 過濾掉常見的非錯誤訊息
+            if echo "$line" | grep -qE "^(Loaded|Okay)" 2>/dev/null; then
+                continue
+            fi
+            # 其他非 JSON 行可能是錯誤
+            echo "$line" >&2
+            continue
+        fi
+        
+        # 取得事件類型
+        event_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
+        
+        case "$event_type" in
+            "message")
+                # 訊息事件，提取 assistant 的內容
+                local role=$(echo "$line" | jq -r '.role // empty' 2>/dev/null)
+                if [ "$role" = "assistant" ]; then
+                    content=$(echo "$line" | jq -r '.content // empty' 2>/dev/null)
+                    if [ -n "$content" ] && [ "$content" != "null" ] && [ "$content" != "" ]; then
+                        echo -n "$content"
+                        first_content=false
+                    fi
+                fi
+                ;;
+            "error")
+                # 錯誤事件
+                local error_msg=$(echo "$line" | jq -r '.message // .error // empty' 2>/dev/null)
+                if [ -n "$error_msg" ] && [ "$error_msg" != "null" ]; then
+                    echo "" >&2
+                    echo "錯誤: $error_msg" >&2
+                    has_error=true
+                fi
+                ;;
+            "result")
+                # 最終結果事件
+                final_status=$(echo "$line" | jq -r '.status // empty' 2>/dev/null)
+                if [ "$final_status" = "error" ]; then
+                    local error_obj=$(echo "$line" | jq -r '.error // empty' 2>/dev/null)
+                    if [ -n "$error_obj" ] && [ "$error_obj" != "null" ]; then
+                        local error_msg=$(echo "$error_obj" | jq -r '.message // . // empty' 2>/dev/null)
+                        echo "" >&2
+                        echo "生成失敗: $error_msg" >&2
+                        has_error=true
+                    fi
+                fi
+                if [ "$first_content" = false ]; then
+                    echo ""
+                fi
+                ;;
+        esac
+    done
+    
+    # 如果有錯誤，返回非零退出碼
+    if [ "$has_error" = true ] || [ "$final_status" = "error" ]; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# 使用 stream-json 格式以獲得即時輸出
+if [ "$HAS_JQ" = true ]; then
+    # 如果有 jq，使用 stream-json 格式
+    cat "$TEMP_DIFF" | gemini -p "$PROMPT" -o stream-json 2>&1 | process_stream_json > "$TEMP_COMMIT_MSG"
+    GEMINI_EXIT_CODE=${PIPESTATUS[1]}
+    PROCESS_EXIT_CODE=$?
+    if [ $GEMINI_EXIT_CODE -ne 0 ] || [ $PROCESS_EXIT_CODE -ne 0 ]; then
+        GEMINI_EXIT_CODE=1
+    fi
+else
+    # 如果沒有 jq，使用 text 格式
+    if command -v stdbuf > /dev/null 2>&1; then
+        cat "$TEMP_DIFF" | stdbuf -o 0 -e 0 gemini -p "$PROMPT" -o text 2>&1 | grep -v "^Loaded\|^Okay" > "$TEMP_COMMIT_MSG"
+        GEMINI_EXIT_CODE=${PIPESTATUS[1]}
+    else
+        cat "$TEMP_DIFF" | gemini -p "$PROMPT" -o text 2>&1 | grep -v "^Loaded\|^Okay" > "$TEMP_COMMIT_MSG"
+        GEMINI_EXIT_CODE=${PIPESTATUS[1]}
+    fi
+fi
+
+set -e
+
+if [ $GEMINI_EXIT_CODE -ne 0 ] || [ ! -s "$TEMP_COMMIT_MSG" ]; then
+    echo "" >&2
+    echo "錯誤: 生成 commit 訊息失敗" >&2
+    exit 1
+fi
+
+# 步驟 4: 清理並以 code block 格式輸出，方便複製
+# 清理 commit 訊息：移除前後空白、code block 標記等
+COMMIT_MSG=$(cat "$TEMP_COMMIT_MSG" | \
+    sed 's/^```[a-z]*$//g' | \
+    sed 's/^```$//g' | \
+    sed '/^[[:space:]]*$/d' | \
+    sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+# 移除前後的連續空行
+COMMIT_MSG=$(echo "$COMMIT_MSG" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+
+if [ -z "$COMMIT_MSG" ] || [ -z "$(echo "$COMMIT_MSG" | tr -d '[:space:]')" ]; then
+    echo "錯誤: 生成的 commit 訊息為空" >&2
+    exit 1
+fi
+
+echo "生成的 commit 訊息："
+echo ""
+echo '```'
+echo "$COMMIT_MSG"
+echo '```'
+echo ""
+echo "提示: 您可以複製上面的 commit 訊息並執行："
+echo "  git commit -m \"您的 commit 訊息\""
+
